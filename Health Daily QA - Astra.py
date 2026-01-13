@@ -345,7 +345,7 @@ with st.sidebar:
     preadm_in = st.text_input("PreAdm Sheets", "PreAdm, Pre Adm, Preadmission")
     appto_in = st.text_input("APPTO Sheets", "APPTO, APPTO IP, Appto")
     ben_ip_in = st.text_input("Benefit IP Sheets", "Benefit IP")
-    ben_op_in = st.text_input("Benefit OP", "Benefit OP Dll", "Benefit OP dll")
+    ben_op_in = st.text_input("Benefit OP Sheets", "Benefit OP, Benefit OP Dll, Benefit OP dll")
 
 # --- Main Area ---
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
@@ -386,4 +386,5 @@ if uploaded_file and st.button("Start Processing"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     )
+
 
