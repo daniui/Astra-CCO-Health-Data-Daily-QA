@@ -338,6 +338,7 @@ st.markdown("""
 with st.sidebar:
     st.header("Configuration")
     api_key = st.text_input("Gemini API Key (Optional)", type="password")
+    PIC_Name = st.text_input("PIC Name", type="pic name")
     
     st.subheader("Sheet Name Mapping")
     st.caption("Use exact names (case-sensitive). Separate with comma.")
@@ -382,9 +383,10 @@ if uploaded_file and st.button("Start Processing"):
     st.download_button(
         label="📥 Download Processed File",
         data=final_buffer.getvalue(),
-        file_name="Processed_Claims_Data.xlsx",
+        file_name=f"Processed_QA_Date_Batch_{PIC_Name}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     )
+
 
 
