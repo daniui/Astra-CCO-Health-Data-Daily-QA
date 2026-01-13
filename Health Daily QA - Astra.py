@@ -15,6 +15,12 @@ import typing_extensions
 # ==========================================
 st.set_page_config(page_title="Claims Data Processor", layout="wide")
 
+COL_MAP = {
+    'call_id': 'Call ID',
+    'member_no': 'Member No',
+    'remarks': 'Remarks'
+}
+
 def clean_for_excel(val):
     if not isinstance(val, str):
         return val
@@ -236,19 +242,88 @@ def run_phase_1(input_file, preadm_list, appto_list, benefit_ip_list, benefit_op
 # ==========================================
 # 2. PHASE 2: GEMINI AI PROCESSING
 # ==========================================
+# ==========================================
+# 2. PHASE 2: GEMINI AI PROCESSING (UPDATED STRICT MODE)
+# ==========================================
+
+# --- PYDANTIC SCHEMAS ---
+class MedicalItem(BaseModel):
+    name: str
+    amount: float
+    type: str
+
+class CaseExtraction(BaseModel):
+    row_id: int
+    final_status: Literal['Approved', 'Butuh Konfirmasi', 'Ditolak', 'Others']
+    # Deskripsi Field Tajam untuk Konsistensi
+    billing_logic: str = Field(..., description="Penjelasan naratif dengan pola: [Kondisi Awal] -> [Perubahan/Konflik Bill dan Statusnya] -> [Keputusan Akhir].")
+    final_bill: float
+    items: List[MedicalItem]
+
+class BatchResult(BaseModel):
+    results: List[CaseExtraction]
+
 def preprocess_text(text):
     if not isinstance(text, str): return ""
+    # Hapus .00 di akhir (sen)
     text = re.sub(r'\.00(?!\d)', '', text)
+    # Hapus titik ribuan (misal 43.000.000 -> 43000000)
     text = re.sub(r'(?<=\d)\.(?=\d)', '', text)
     text = text.replace("Rp.", "Rp ")
     return text
 
+def process_batch_consistent(model, batch_data, max_retries=3):
+    prompt = f"""
+    Anda adalah Senior Claim Analyst. Tugas: Ekstrak Final Bill & Logic.
+    INPUT: Teks sudah dipreprocessing (titik ribuan dihapus).
+
+    ATURAN LOGIC (STORYTELLING):
+    Gunakan pola: "Kondisi Awal... Namun/Kemudian... Sehingga Keputusan..."
+    
+    ATURAN BILLING:
+    - Status: 'Approved', 'Butuh Konfirmasi', 'Ditolak', 'Others'.
+    - Ambil biaya Tindakan Utama (PRIMARY) sebagai Final Bill.
+    
+    DATA INPUT:
+    {json.dumps(batch_data)}
+    """
+    
+    # Konfigurasi ketat agar output patuh schema
+    gen_config = genai.GenerationConfig(
+        response_mime_type="application/json",
+        temperature=0.0,
+        response_schema=BatchResult # Memaksa struktur output
+    )
+    
+    wait_time = 5 # Adjusted for streamlit context
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt, generation_config=gen_config)
+            
+            # --- PERBAIKAN DI SINI (AUTO-DETECT LIST vs DICT) ---
+            parsed = json.loads(response.text)
+            
+            # Jika AI mengembalikan List langsung [...] 
+            if isinstance(parsed, list):
+                return parsed
+            
+            # Jika AI mengembalikan Dict {"results": [...]} 
+            elif isinstance(parsed, dict):
+                return parsed.get('results', [])
+                
+            return [] # Format tidak dikenali
+
+        except exceptions.ResourceExhausted:
+            time.sleep(wait_time)
+            wait_time *= 2
+        except Exception as e:
+            time.sleep(2)
+            
+    return []
+
 def run_phase_2(excel_buffer, api_key):
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        'gemini-2.0-flash-exp',
-        generation_config={"response_mime_type": "application/json"}
-    )
+    model = genai.GenerativeModel('gemini-2.0-flash-exp')
     
     # Read the processed file from memory
     excel_buffer.seek(0)
@@ -264,58 +339,82 @@ def run_phase_2(excel_buffer, api_key):
             # Only process APPTO IP sheets with AI
             if "APPTO" in sheet_name.upper():
                 logs.append(f"AI Processing for: {sheet_name}")
-                results = []
+                
+                # Check Columns
+                for key, val in COL_MAP.items():
+                    if val not in df.columns:
+                        logs.append(f"ERROR: Kolom '{val}' tidak ada di sheet {sheet_name}. Skip AI.")
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        continue
+
+                df['row_id_internal'] = df.index
+                batch_output_list = []
                 
                 # Batch processing
                 BATCH_SIZE = 5
                 progress_bar = st.progress(0)
                 
-                for i in range(0, len(df), BATCH_SIZE):
+                total_rows = len(df)
+                
+                for i in range(0, total_rows, BATCH_SIZE):
                     batch = df.iloc[i : i + BATCH_SIZE]
                     payload = []
+                    meta_map = {}
                     
                     for idx, row in batch.iterrows():
-                        text = preprocess_text(str(row.get('Remarks', '')))
-                        payload.append({"row_id": idx, "text": text})
-                    
-                    prompt = f"""
-                    You are a Senior Claim Analyst. Extract Final Bill & Logic.
-                    INPUT: {json.dumps(payload)}
-                    OUTPUT JSON Schema: {{ "results": [ {{ "row_id": int, "final_status": "Approved"|"Butuh Konfirmasi"|"Ditolak"|"Others", "billing_logic": string, "final_bill": float, "items": [{{ "name": string, "amount": float, "type": "PRIMARY"|"SUPPORTING" }}] }} ] }}
-                    """
-                    
-                    try:
-                        response = model.generate_content(prompt)
-                        parsed = json.loads(response.text)
+                        rid = row['row_id_internal']
+                        raw_text = str(row[COL_MAP['remarks']]) if pd.notna(row[COL_MAP['remarks']]) else ""
+                        clean_text = preprocess_text(raw_text)
                         
-                        # Handle list vs dict response
-                        batch_res = parsed if isinstance(parsed, list) else parsed.get('results', [])
-                        
-                        for res in batch_res:
+                        payload.append({"row_id": rid, "text": clean_text})
+                        meta_map[rid] = {
+                            "call id": row.get(COL_MAP['call_id']),
+                            "member no": row.get(COL_MAP['member_no']),
+                            "remarks": raw_text
+                        }
+                    
+                    # Call Strict Function
+                    ai_results = process_batch_consistent(model, payload)
+                    
+                    if ai_results:
+                        for res in ai_results:
+                            if not isinstance(res, dict): res = res.dict()
+                            
                             rid = res.get('row_id')
-                            # Find original row
-                            if rid is not None:
-                                items_str = "\n".join([f"- {x['name']}: {x['amount']}" for x in res.get('items', [])])
-                                results.append({
-                                    'row_id_temp': rid,
-                                    'AI_Status': res.get('final_status'),
-                                    'AI_Bill': res.get('final_bill'),
-                                    'AI_Logic': res.get('billing_logic'),
-                                    'AI_Items': items_str
-                                })
-                    except Exception as e:
-                        logs.append(f"Error batch {i}: {e}")
+                            meta = meta_map.get(rid, {})
+                            
+                            # Format Items to String for Excel
+                            items_obj = res.get('items', [])
+                            item_str_list = []
+                            for item in items_obj:
+                                if not isinstance(item, dict): item = item.dict()
+                                name = item.get('name', '-')
+                                itype = item.get('type', '-')
+                                amount = item.get('amount', 0)
+                                item_str_list.append(f"- {name} ({itype}): Rp {amount:,.0f}")
+                            
+                            row_data = {
+                                'row_id_internal': rid,
+                                'call id': meta.get('call id'),
+                                'member no': meta.get('member no'),
+                                'remarks': meta.get('remarks'),
+                                'final_status': res.get('final_status'),
+                                'final_bill': res.get('final_bill'),
+                                'billing_logic': res.get('billing_logic'),
+                                'Breakdown Items': "\n".join(item_str_list)
+                            }
+                            batch_output_list.append(row_data)
                     
-                    progress_bar.progress(min((i + BATCH_SIZE) / len(df), 1.0))
-                    time.sleep(1) # Rate limit handling
+                    progress_bar.progress(min((i + BATCH_SIZE) / total_rows, 1.0))
                 
-                # Merge AI results back to DF
-                if results:
-                    df_ai = pd.DataFrame(results)
-                    # Join based on index/row_id
-                    df['row_id_temp'] = df.index
-                    df = pd.merge(df, df_ai, on='row_id_temp', how='left')
-                    df.drop(columns=['row_id_temp'], inplace=True)
+                # Merge AI results back 
+                if batch_output_list:
+                    df_ai = pd.DataFrame(batch_output_list)
+                    # Merge on row_id_internal to keep original order
+                    df = pd.merge(df, df_ai[['row_id_internal', 'final_status', 'final_bill', 'billing_logic', 'Breakdown Items']], on='row_id_internal', how='left')
+                    df.drop(columns=['row_id_internal'], inplace=True)
+                else:
+                    df.drop(columns=['row_id_internal'], inplace=True, errors='ignore')
 
             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
@@ -346,7 +445,7 @@ with st.sidebar:
     preadm_in = st.text_input("PreAdm Sheets", "PreAdm, Pre Adm, Preadmission")
     appto_in = st.text_input("APPTO Sheets", "APPTO, APPTO IP, Appto")
     ben_ip_in = st.text_input("Benefit IP Sheets", "Benefit IP")
-    # ben_op_in = st.text_input("Benefit OP Sheets", "Benefit OP, Benefit OP Dll, Benefit OP dll")
+    ben_op_in = st.text_input("Benefit OP Sheets", "Benefit OP, Benefit OP Dll, Benefit OP dll")
 
 # --- Main Area ---
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
@@ -387,6 +486,7 @@ if uploaded_file and st.button("Start Processing"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     )
+
 
 
 
